@@ -17,9 +17,9 @@ from src.squad_eval import SquadEvaluator
 # 配置
 MODEL_NAME = 'Qwen/Qwen2.5-7B-Instruct'
 DEVICE = 'cuda'
-MAX_SAMPLES = 2000
-NUM_EPOCHS = 3
-BATCH_SIZE = 2  # 7B 模型用小 batch
+MAX_SAMPLES = 10000
+NUM_EPOCHS = 1
+BATCH_SIZE = 4  # 7B 模型用小 batch
 EVAL_SAMPLES = 100  # 评估样本数
 
 def main():
