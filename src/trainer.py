@@ -99,6 +99,47 @@ def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: in
     }
 
 
+def _resolve_base_model(model: PreTrainedModel) -> nn.Module:
+    """Return the transformer block so we can run it without the lm_head."""
+    candidate_attrs = ("model", "transformer", "decoder", "base_model")
+    for attr in candidate_attrs:
+        module = getattr(model, attr, None)
+        if module is not None:
+            return module
+    raise ValueError("Could not find base transformer module on the model")
+
+
+def _forward_hidden_states(
+    base_model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> List[torch.Tensor]:
+    """Run the frozen base model and return its hidden states."""
+    try:
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+    except TypeError:
+        # Some base models might not accept use_cache
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+    hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else None
+    if hidden_states is None and isinstance(outputs, tuple) and len(outputs) >= 3:
+        hidden_states = outputs[2]
+    if hidden_states is None:
+        raise ValueError("Base model did not return hidden states")
+    return hidden_states
+
+
 class LMHeadOnlyTrainer:
     """
     Trainer for fine-tuning ONLY the lm_head (baseline, no cross-batch).
@@ -118,6 +159,7 @@ class LMHeadOnlyTrainer:
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
+        self.base_model = _resolve_base_model(self.model)
 
         # Freeze the base model
         for param in self.model.parameters():
@@ -163,12 +205,11 @@ class LMHeadOnlyTrainer:
 
         for step in range(max_gen_steps):
             with torch.no_grad():
-                outputs = self.model(
-                    input_ids=current_ids,
-                    attention_mask=current_mask,
-                    output_hidden_states=True,
-                )
-                hidden_states = outputs.hidden_states[-1]
+                hidden_states = _forward_hidden_states(
+                    self.base_model,
+                    current_ids,
+                    current_mask,
+                )[-1]
 
             seq_lengths = current_mask.sum(dim=1) - 1
             last_hidden = hidden_states[torch.arange(batch_size, device=self.device), seq_lengths]
@@ -306,6 +347,7 @@ class CrossBatchTrainer:
         self.tokenizer = tokenizer
         self.device = device
         self.train_lm_head = train_lm_head
+        self.base_model = _resolve_base_model(self.model)
 
         # Freeze the base model
         for param in self.model.parameters():
@@ -407,12 +449,11 @@ class CrossBatchTrainer:
         for step in range(max_gen_steps):
             # Forward pass through frozen model
             with torch.no_grad():
-                outputs = self.model(
-                    input_ids=current_ids,
-                    attention_mask=current_mask,
-                    output_hidden_states=True,
-                )
-                hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
+                hidden_states = _forward_hidden_states(
+                    self.base_model,
+                    current_ids,
+                    current_mask,
+                )[-1]  # [batch, seq, hidden]
 
             # Get the last token's hidden state
             seq_lengths = current_mask.sum(dim=1) - 1
