@@ -40,8 +40,30 @@ def main():
     train_dataset = SQuADDataset(tokenizer=tokenizer, split='train', max_samples=MAX_SAMPLES)
     print(f'训练数据集大小: {len(train_dataset)}')
 
-    # 1. 训练 Baseline
-    print('\n[1/2] 训练 Baseline (只训练 lm_head)')
+    os.makedirs('outputs/inference_results', exist_ok=True)
+    all_results = {}
+
+    # 1. 评估原始模型
+    print('\n[1/3] 评估原始模型 (未微调)')
+    print('-' * 40)
+    model_original = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+    generator_original = CrossBatchGenerator(
+        model=model_original,
+        tokenizer=tokenizer,
+        cross_batch_module=CrossBatchAttention(hidden_size=model_original.config.hidden_size),
+        device=DEVICE,
+    )
+    evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
+    results_original = evaluator_original.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+    all_results['original'] = results_original['metrics']
+    print(f'原始模型 - EM: {results_original["metrics"]["exact_match"]:.2f}, F1: {results_original["metrics"]["f1"]:.2f}')
+
+    del model_original, generator_original, evaluator_original
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # 2. Baseline 训练 + 测试
+    print('\n[2/3] Baseline：训练后立刻评估 (只训练 lm_head)')
     print('-' * 40)
     model_baseline = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
     trainer_baseline = LMHeadOnlyTrainer(
@@ -54,16 +76,26 @@ def main():
         train_dataset=train_dataset,
         num_epochs=NUM_EPOCHS,
         batch_size=BATCH_SIZE,
-        save_dir='checkpoints_baseline_7b',
+        save_dir=None,
     )
     print(f'Baseline 最终 Loss: {history_baseline["train_loss"][-1]:.4f}')
 
-    del model_baseline, trainer_baseline
+    generator_baseline = CrossBatchGenerator(
+        model=model_baseline,
+        tokenizer=tokenizer,
+        device=DEVICE,
+    )
+    evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
+    results_baseline = evaluator_baseline.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+    all_results['baseline'] = results_baseline['metrics']
+    print(f'Baseline - EM: {results_baseline["metrics"]["exact_match"]:.2f}, F1: {results_baseline["metrics"]["f1"]:.2f}')
+
+    del generator_baseline, evaluator_baseline, trainer_baseline, model_baseline
     gc.collect()
     torch.cuda.empty_cache()
 
-    # 2. 训练 Cross-Batch
-    print('\n[2/2] 训练 Cross-Batch (lm_head + cross-batch)')
+    # 3. Cross-Batch 训练 + 测试
+    print('\n[3/3] Cross-Batch：训练后立刻评估 (lm_head + cross-batch)')
     print('-' * 40)
     model_crossbatch = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
     cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
@@ -79,82 +111,24 @@ def main():
         train_dataset=train_dataset,
         num_epochs=NUM_EPOCHS,
         batch_size=BATCH_SIZE,
-        save_dir='checkpoints_crossbatch_7b',
+        save_dir=None,
     )
     print(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}')
-
-    del model_crossbatch, trainer_crossbatch, cross_batch_module
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # ============================================
-    # 3. 三方对比评估
-    # ============================================
-    print('\n[3/3] 三方对比评估')
-    print('-' * 40)
-
-    os.makedirs('outputs/inference_results', exist_ok=True)
-    all_results = {}
-
-    # 3.1 原始模型评估
-    print('\n评估原始模型...')
-    model_original = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
-    generator_original = CrossBatchGenerator(
-        model=model_original,
-        tokenizer=tokenizer,
-        cross_batch_module=CrossBatchAttention(hidden_size=model_original.config.hidden_size),
-        device=DEVICE,
-    )
-    evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
-    results_original = evaluator_original.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
-    all_results['original'] = results_original['metrics']
-    print(f'原始模型 - EM: {results_original["metrics"]["exact_match"]:.2f}, F1: {results_original["metrics"]["f1"]:.2f}')
-
-    del model_original, generator_original
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # 3.2 Baseline 评估
-    print('\n评估 Baseline 模型...')
-    model_baseline = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
-    checkpoint_baseline = torch.load('checkpoints_baseline_7b/best_model.pt', map_location=DEVICE)
-    model_baseline.lm_head.load_state_dict(checkpoint_baseline['lm_head'])
-
-    generator_baseline = CrossBatchGenerator(
-        model=model_baseline,
-        tokenizer=tokenizer,
-        cross_batch_module=CrossBatchAttention(hidden_size=model_baseline.config.hidden_size),
-        device=DEVICE,
-    )
-    evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
-    results_baseline = evaluator_baseline.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
-    all_results['baseline'] = results_baseline['metrics']
-    print(f'Baseline - EM: {results_baseline["metrics"]["exact_match"]:.2f}, F1: {results_baseline["metrics"]["f1"]:.2f}')
-
-    del model_baseline, generator_baseline
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # 3.3 Cross-Batch 评估
-    print('\n评估 Cross-Batch 模型...')
-    model_crossbatch = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
-    checkpoint_crossbatch = torch.load('checkpoints_crossbatch_7b/best_model.pt', map_location=DEVICE)
-    if 'lm_head' in checkpoint_crossbatch:
-        model_crossbatch.lm_head.load_state_dict(checkpoint_crossbatch['lm_head'])
-
-    cross_batch_module_eval = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
-    cross_batch_module_eval.load_state_dict(checkpoint_crossbatch['cross_batch_module'])
 
     generator_crossbatch = CrossBatchGenerator(
         model=model_crossbatch,
         tokenizer=tokenizer,
-        cross_batch_module=cross_batch_module_eval,
+        cross_batch_module=trainer_crossbatch.cross_batch_module,
         device=DEVICE,
     )
     evaluator_crossbatch = SquadEvaluator(generator_crossbatch, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
     results_crossbatch = evaluator_crossbatch.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=True)
     all_results['crossbatch'] = results_crossbatch['metrics']
     print(f'Cross-Batch - EM: {results_crossbatch["metrics"]["exact_match"]:.2f}, F1: {results_crossbatch["metrics"]["f1"]:.2f}')
+
+    del generator_crossbatch, evaluator_crossbatch, trainer_crossbatch, model_crossbatch, cross_batch_module
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # ============================================
     # 保存结果

@@ -140,6 +140,11 @@ def _forward_hidden_states(
     return hidden_states
 
 
+def _clone_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
+    """Detach module weights to CPU so we can restore best states later."""
+    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+
+
 class LMHeadOnlyTrainer:
     """
     Trainer for fine-tuning ONLY the lm_head (baseline, no cross-batch).
@@ -182,6 +187,7 @@ class LMHeadOnlyTrainer:
             weight_decay=weight_decay,
         )
         self.scheduler = None
+        self.best_lm_head_state = None
 
     def compute_loss(
         self,
@@ -282,9 +288,10 @@ class LMHeadOnlyTrainer:
         num_epochs: int = 3,
         batch_size: int = 8,
         max_length: int = 512,
-        save_dir: str = "checkpoints_lmhead_only",
+        save_dir: Optional[str] = "checkpoints_lmhead_only",
     ) -> Dict[str, Any]:
-        os.makedirs(save_dir, exist_ok=True)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
 
         train_loader = DataLoader(
             train_dataset,
@@ -311,11 +318,18 @@ class LMHeadOnlyTrainer:
 
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
-                self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
+                self.best_lm_head_state = _clone_state_dict(self.model.lm_head)
+                if save_dir:
+                    self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
 
-        self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
-        with open(os.path.join(save_dir, "training_history.json"), "w") as f:
-            json.dump(history, f, indent=2)
+        # Restore best state for in-memory evaluation
+        if self.best_lm_head_state is not None:
+            self.model.lm_head.load_state_dict(self.best_lm_head_state)
+
+        if save_dir:
+            self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
+            with open(os.path.join(save_dir, "training_history.json"), "w") as f:
+                json.dump(history, f, indent=2)
 
         return history
 
@@ -383,6 +397,8 @@ class CrossBatchTrainer:
         )
 
         self.scheduler = None
+        self.best_cross_batch_state = None
+        self.best_lm_head_state = None
 
     def _hidden_to_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Convert hidden states to logits."""
@@ -595,7 +611,7 @@ class CrossBatchTrainer:
         num_epochs: int = 3,
         batch_size: int = 8,
         max_length: int = 512,
-        save_dir: str = "checkpoints",
+        save_dir: Optional[str] = "checkpoints",
         eval_dataset: Optional[Dataset] = None,
     ) -> Dict[str, Any]:
         """
@@ -612,7 +628,8 @@ class CrossBatchTrainer:
         Returns:
             Training history
         """
-        os.makedirs(save_dir, exist_ok=True)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
 
         # Create dataloader
         train_loader = DataLoader(
@@ -657,19 +674,32 @@ class CrossBatchTrainer:
             # Save best model
             if metrics["improvement"] > best_improvement:
                 best_improvement = metrics["improvement"]
-                self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
-                logger.info(f"Saved best model with improvement: {best_improvement:.4f}")
+                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module)
+                if self.train_lm_head and hasattr(self.model, 'lm_head'):
+                    self.best_lm_head_state = _clone_state_dict(self.model.lm_head)
+                if save_dir:
+                    self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
+                    logger.info(f"Saved best model with improvement: {best_improvement:.4f}")
+                else:
+                    logger.info(f"New best improvement: {best_improvement:.4f}")
 
             # Save periodic checkpoint
-            if epoch % 5 == 0:
+            if save_dir and epoch % 5 == 0:
                 self.save_checkpoint(os.path.join(save_dir, f"checkpoint_epoch{epoch}.pt"))
 
-        # Save final model
-        self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
+        # Restore best states for subsequent evaluation
+        if self.best_cross_batch_state is not None:
+            self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
+        if self.best_lm_head_state is not None and hasattr(self.model, 'lm_head'):
+            self.model.lm_head.load_state_dict(self.best_lm_head_state)
 
-        # Save training history
-        with open(os.path.join(save_dir, "training_history.json"), "w") as f:
-            json.dump(history, f, indent=2)
+        if save_dir:
+            # Save final model
+            self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
+
+            # Save training history
+            with open(os.path.join(save_dir, "training_history.json"), "w") as f:
+                json.dump(history, f, indent=2)
 
         return history
 
@@ -704,7 +734,7 @@ def train_cross_batch_module(
     batch_size: int = 8,
     learning_rate: float = 1e-4,
     max_samples: int = 5000,
-    save_dir: str = "checkpoints",
+    save_dir: Optional[str] = "checkpoints",
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
