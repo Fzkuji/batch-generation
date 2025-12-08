@@ -1,5 +1,6 @@
 """
 7B 模型训练脚本 - 用于远程服务器
+包含训练和三方对比评估
 """
 import torch
 import gc
@@ -10,6 +11,8 @@ from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.trainer import LMHeadOnlyTrainer, CrossBatchTrainer, SQuADDataset
 from src.cross_batch_attention import CrossBatchAttention
+from src.cross_batch_generator import CrossBatchGenerator
+from src.squad_eval import SquadEvaluator
 
 # 配置
 MODEL_NAME = 'Qwen/Qwen2.5-7B-Instruct'
@@ -17,6 +20,7 @@ DEVICE = 'cuda'
 MAX_SAMPLES = 2000
 NUM_EPOCHS = 3
 BATCH_SIZE = 2  # 7B 模型用小 batch
+EVAL_SAMPLES = 100  # 评估样本数
 
 def main():
     gc.collect()
@@ -79,27 +83,132 @@ def main():
     )
     print(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}')
 
-    # 保存训练历史
+    del model_crossbatch, trainer_crossbatch, cross_batch_module
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ============================================
+    # 3. 三方对比评估
+    # ============================================
+    print('\n[3/3] 三方对比评估')
+    print('-' * 40)
+
+    os.makedirs('outputs/inference_results', exist_ok=True)
+    all_results = {}
+
+    # 3.1 原始模型评估
+    print('\n评估原始模型...')
+    model_original = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+    generator_original = CrossBatchGenerator(
+        model=model_original,
+        tokenizer=tokenizer,
+        cross_batch_module=CrossBatchAttention(hidden_size=model_original.config.hidden_size),
+        device=DEVICE,
+    )
+    evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
+    results_original = evaluator_original.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+    all_results['original'] = results_original['metrics']
+    print(f'原始模型 - EM: {results_original["metrics"]["exact_match"]:.2f}, F1: {results_original["metrics"]["f1"]:.2f}')
+
+    del model_original, generator_original
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # 3.2 Baseline 评估
+    print('\n评估 Baseline 模型...')
+    model_baseline = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+    checkpoint_baseline = torch.load('checkpoints_baseline_7b/best_model.pt', map_location=DEVICE)
+    model_baseline.lm_head.load_state_dict(checkpoint_baseline['lm_head'])
+
+    generator_baseline = CrossBatchGenerator(
+        model=model_baseline,
+        tokenizer=tokenizer,
+        cross_batch_module=CrossBatchAttention(hidden_size=model_baseline.config.hidden_size),
+        device=DEVICE,
+    )
+    evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
+    results_baseline = evaluator_baseline.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+    all_results['baseline'] = results_baseline['metrics']
+    print(f'Baseline - EM: {results_baseline["metrics"]["exact_match"]:.2f}, F1: {results_baseline["metrics"]["f1"]:.2f}')
+
+    del model_baseline, generator_baseline
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # 3.3 Cross-Batch 评估
+    print('\n评估 Cross-Batch 模型...')
+    model_crossbatch = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+    checkpoint_crossbatch = torch.load('checkpoints_crossbatch_7b/best_model.pt', map_location=DEVICE)
+    if 'lm_head' in checkpoint_crossbatch:
+        model_crossbatch.lm_head.load_state_dict(checkpoint_crossbatch['lm_head'])
+
+    cross_batch_module_eval = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
+    cross_batch_module_eval.load_state_dict(checkpoint_crossbatch['cross_batch_module'])
+
+    generator_crossbatch = CrossBatchGenerator(
+        model=model_crossbatch,
+        tokenizer=tokenizer,
+        cross_batch_module=cross_batch_module_eval,
+        device=DEVICE,
+    )
+    evaluator_crossbatch = SquadEvaluator(generator_crossbatch, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
+    results_crossbatch = evaluator_crossbatch.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=True)
+    all_results['crossbatch'] = results_crossbatch['metrics']
+    print(f'Cross-Batch - EM: {results_crossbatch["metrics"]["exact_match"]:.2f}, F1: {results_crossbatch["metrics"]["f1"]:.2f}')
+
+    # ============================================
+    # 保存结果
+    # ============================================
     summary = {
         'config': {
             'model': MODEL_NAME,
             'train_samples': MAX_SAMPLES,
+            'eval_samples': EVAL_SAMPLES,
             'epochs': NUM_EPOCHS,
             'batch_size': BATCH_SIZE,
         },
-        'baseline_loss': history_baseline['train_loss'],
-        'crossbatch_loss': history_crossbatch['train_loss'],
+        'training_history': {
+            'baseline': history_baseline['train_loss'],
+            'crossbatch': history_crossbatch['train_loss'],
+        },
+        'metrics': all_results,
     }
 
     os.makedirs('outputs', exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with open(f'outputs/training_7b_{timestamp}.json', 'w') as f:
+    output_file = f'outputs/training_7b_{timestamp}.json'
+    with open(output_file, 'w') as f:
         json.dump(summary, f, indent=2)
 
+    # ============================================
+    # 打印总结
+    # ============================================
     print('\n' + '=' * 60)
-    print('训练完成!')
-    print(f'Baseline Loss: {history_baseline["train_loss"][-1]:.4f}')
-    print(f'Cross-Batch Loss: {history_crossbatch["train_loss"][-1]:.4f}')
+    print('三方对比总结 (7B 模型)')
+    print('=' * 60)
+    print(f'| 方法 | EM | F1 |')
+    print(f'|------|-----|-----|')
+    print(f'| 原始模型 | {all_results["original"]["exact_match"]:.2f} | {all_results["original"]["f1"]:.2f} |')
+    print(f'| Baseline (lm_head) | {all_results["baseline"]["exact_match"]:.2f} | {all_results["baseline"]["f1"]:.2f} |')
+    print(f'| Cross-Batch | {all_results["crossbatch"]["exact_match"]:.2f} | {all_results["crossbatch"]["f1"]:.2f} |')
+
+    print('\n改进分析:')
+    orig_f1 = all_results['original']['f1']
+    base_f1 = all_results['baseline']['f1']
+    cross_f1 = all_results['crossbatch']['f1']
+
+    print(f'  Baseline vs 原始: F1 {base_f1 - orig_f1:+.2f}')
+    print(f'  Cross-Batch vs 原始: F1 {cross_f1 - orig_f1:+.2f}')
+    print(f'  Cross-Batch vs Baseline: F1 {cross_f1 - base_f1:+.2f}')
+
+    if cross_f1 - base_f1 > 1.0:
+        print('\n=> Cross-Batch 确实带来了改进！')
+    elif cross_f1 - base_f1 < -1.0:
+        print('\n=> Cross-Batch 反而损害了性能')
+    else:
+        print('\n=> 差异较小，需要更多实验验证')
+
+    print(f'\n结果已保存到: {output_file}')
     print('=' * 60)
 
 if __name__ == '__main__':
