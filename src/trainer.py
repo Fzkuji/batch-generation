@@ -164,6 +164,7 @@ class LMHeadOnlyTrainer:
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
+        self.model_dtype = next(model.parameters()).dtype
         self.base_model = _resolve_base_model(self.model)
 
         # Freeze the base model
@@ -188,6 +189,10 @@ class LMHeadOnlyTrainer:
         )
         self.scheduler = None
         self.best_lm_head_state = None
+
+    def _cast_lm_head_to_model_dtype(self):
+        if hasattr(self.model, 'lm_head'):
+            self.model.lm_head = self.model.lm_head.to(dtype=self.model_dtype)
 
     def compute_loss(
         self,
@@ -325,6 +330,8 @@ class LMHeadOnlyTrainer:
         # Restore best state for in-memory evaluation
         if self.best_lm_head_state is not None:
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
+        # Always cast back to original dtype for inference
+        self._cast_lm_head_to_model_dtype()
 
         if save_dir:
             self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
@@ -399,6 +406,10 @@ class CrossBatchTrainer:
         self.scheduler = None
         self.best_cross_batch_state = None
         self.best_lm_head_state = None
+
+    def _cast_lm_head_to_model_dtype(self):
+        if hasattr(self.model, 'lm_head'):
+            self.model.lm_head = self.model.lm_head.to(dtype=self.model_dtype)
 
     def _hidden_to_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Convert hidden states to logits."""
@@ -692,6 +703,8 @@ class CrossBatchTrainer:
             self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
         if self.best_lm_head_state is not None and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
+        # Cast lm_head back to original dtype for inference
+        self._cast_lm_head_to_model_dtype()
 
         if save_dir:
             # Save final model
