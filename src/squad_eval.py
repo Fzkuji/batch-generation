@@ -88,33 +88,123 @@ def compute_metrics(predictions: List[str], references: List[List[str]]) -> Dict
     }
 
 
-def format_squad_prompt(context: str, question: str) -> str:
-    """Format a SQuAD example as a prompt."""
-    prompt = f"""Context: {context}
+def format_squad_prompt(context: str, question: str, use_chat_template: bool = False, tokenizer=None) -> str:
+    """Format a SQuAD example as a prompt.
+
+    Args:
+        context: The context paragraph
+        question: The question to answer
+        use_chat_template: Whether to use chat template format for instruct models
+        tokenizer: Required if use_chat_template=True
+    """
+    if use_chat_template and tokenizer is not None:
+        # Use chat template for instruct models
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer the question based only on the given context. Give a short, direct answer without explanation."
+            },
+            {
+                "role": "user",
+                "content": f"Context: {context}\n\nQuestion: {question}\n\nAnswer with only the answer, nothing else."
+            }
+        ]
+        # Apply chat template without adding generation prompt (we'll let the model continue)
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return prompt
+    else:
+        # Simple completion format for base models
+        prompt = f"""Context: {context}
 
 Question: {question}
 
 Answer:"""
-    return prompt
+        return prompt
 
 
-def extract_answer(generated_text: str, prompt: str) -> str:
-    """Extract the answer from generated text."""
-    # Remove the prompt from generated text
-    if generated_text.startswith(prompt):
-        answer = generated_text[len(prompt):].strip()
+def extract_answer(generated_text: str, prompt: str, use_chat_template: bool = False) -> str:
+    """Extract the answer from generated text.
+
+    Args:
+        generated_text: The full generated text including prompt
+        prompt: The original prompt
+        use_chat_template: Whether chat template was used (affects extraction logic)
+    """
+    # For chat template format, the generated text after skip_special_tokens=True
+    # looks like: "system\n...\nuser\n...\nassistant\nANSWER"
+    if use_chat_template:
+        # Try multiple extraction methods for chat format
+        # Method 1: Look for "assistant\n" marker (after skip_special_tokens)
+        if "\nassistant\n" in generated_text:
+            answer = generated_text.split("\nassistant\n")[-1].strip()
+        elif "assistant\n" in generated_text:
+            answer = generated_text.split("assistant\n")[-1].strip()
+        # Method 2: Look for special tokens (if not stripped)
+        elif "<|im_start|>assistant" in generated_text:
+            parts = generated_text.split("<|im_start|>assistant")
+            if len(parts) > 1:
+                answer = parts[-1].strip()
+                if "<|im_end|>" in answer:
+                    answer = answer.split("<|im_end|>")[0].strip()
+            else:
+                answer = generated_text.strip()
+        else:
+            # Fallback: take the last line
+            answer = generated_text.strip().split('\n')[-1].strip()
     else:
-        # Try to find "Answer:" marker
-        if "Answer:" in generated_text:
+        # Non-chat format
+        if generated_text.startswith(prompt):
+            answer = generated_text[len(prompt):].strip()
+        elif "Answer:" in generated_text:
             answer = generated_text.split("Answer:")[-1].strip()
         else:
             answer = generated_text.strip()
 
-    # Take first line/sentence as answer
-    answer = answer.split('\n')[0].strip()
-    answer = answer.split('.')[0].strip()
+    # Clean up the answer
+    # Remove common prefixes that models add
+    prefixes_to_remove = [
+        "The answer is ",
+        "The answer is: ",
+        "Answer: ",
+        "Based on the context, ",
+        "According to the context, ",
+        "Human: ",
+        "User: ",
+        "Assistant: ",
+    ]
+    answer_lower = answer.lower()
+    for prefix in prefixes_to_remove:
+        if answer_lower.startswith(prefix.lower()):
+            answer = answer[len(prefix):].strip()
+            break
+
+    # Take first line as answer (but don't split on periods for short answers)
+    first_line = answer.split('\n')[0].strip()
+
+    # Only split on period if the answer is long (> 50 chars) to avoid cutting short answers
+    if len(first_line) > 50 and '.' in first_line:
+        # Take first sentence
+        first_line = first_line.split('.')[0].strip()
+
+    # Remove trailing punctuation
+    answer = first_line.rstrip('.,;:!?')
 
     return answer
+
+
+def is_instruct_model(model_name_or_tokenizer) -> bool:
+    """Check if a model is an instruct/chat model based on its name or tokenizer."""
+    if hasattr(model_name_or_tokenizer, 'name_or_path'):
+        name = model_name_or_tokenizer.name_or_path.lower()
+    else:
+        name = str(model_name_or_tokenizer).lower()
+
+    instruct_keywords = ['instruct', 'chat', 'it', 'rlhf', 'dpo', 'sft']
+    return any(kw in name for kw in instruct_keywords)
 
 
 class SquadEvaluator:
@@ -126,11 +216,18 @@ class SquadEvaluator:
         tokenizer: PreTrainedTokenizer,
         split: str = "validation",
         max_samples: int = None,
+        use_chat_template: bool = None,  # None = auto-detect
     ):
         self.generator = generator
         self.tokenizer = tokenizer
         self.split = split
         self.max_samples = max_samples
+
+        # Auto-detect whether to use chat template
+        if use_chat_template is None:
+            self.use_chat_template = is_instruct_model(tokenizer) and hasattr(tokenizer, 'apply_chat_template')
+        else:
+            self.use_chat_template = use_chat_template
 
         # Load dataset
         self.dataset = load_dataset("squad", split=split)
@@ -147,7 +244,12 @@ class SquadEvaluator:
 
         for idx in batch_indices:
             example = self.dataset[idx]
-            prompt = format_squad_prompt(example["context"], example["question"])
+            prompt = format_squad_prompt(
+                example["context"],
+                example["question"],
+                use_chat_template=self.use_chat_template,
+                tokenizer=self.tokenizer,
+            )
             prompts.append(prompt)
             references.append(example["answers"]["text"])
 
@@ -217,7 +319,7 @@ class SquadEvaluator:
 
             # Extract answers
             for prompt, gen_text, refs in zip(prompts, generated_texts, references):
-                answer = extract_answer(gen_text, prompt)
+                answer = extract_answer(gen_text, prompt, use_chat_template=self.use_chat_template)
                 all_predictions.append(answer)
                 all_references.append(refs)
                 all_prompts.append(prompt)

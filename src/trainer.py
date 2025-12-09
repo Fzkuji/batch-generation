@@ -28,6 +28,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def is_instruct_model(model_name_or_tokenizer) -> bool:
+    """Check if a model is an instruct/chat model based on its name or tokenizer."""
+    if hasattr(model_name_or_tokenizer, 'name_or_path'):
+        name = model_name_or_tokenizer.name_or_path.lower()
+    else:
+        name = str(model_name_or_tokenizer).lower()
+
+    instruct_keywords = ['instruct', 'chat', 'it', 'rlhf', 'dpo', 'sft']
+    return any(kw in name for kw in instruct_keywords)
+
+
 class SQuADDataset(Dataset):
     """SQuAD dataset for training cross-batch module."""
 
@@ -37,9 +48,16 @@ class SQuADDataset(Dataset):
         split: str = "train",
         max_samples: Optional[int] = None,
         max_length: int = 512,
+        use_chat_template: bool = None,  # None = auto-detect
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
+
+        # Auto-detect whether to use chat template
+        if use_chat_template is None:
+            self.use_chat_template = is_instruct_model(tokenizer) and hasattr(tokenizer, 'apply_chat_template')
+        else:
+            self.use_chat_template = use_chat_template
 
         # Load dataset
         dataset = load_dataset("squad", split=split)
@@ -53,11 +71,31 @@ class SQuADDataset(Dataset):
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
-                "full_text": prompt + " " + answer,
+                "full_text": prompt + answer,  # No space for chat template
             })
 
     def _format_prompt(self, context: str, question: str) -> str:
-        return f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        if self.use_chat_template:
+            # Use chat template for instruct models
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. Answer the question based only on the given context. Give a short, direct answer without explanation."
+                },
+                {
+                    "role": "user",
+                    "content": f"Context: {context}\n\nQuestion: {question}\n\nAnswer with only the answer, nothing else."
+                }
+            ]
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return prompt
+        else:
+            # Simple completion format for base models
+            return f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
 
     def __len__(self):
         return len(self.examples)
